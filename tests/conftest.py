@@ -2,17 +2,9 @@ import json
 from pathlib import Path
 import pytest
 
-FIXTURE = Path(__file__).parent / "fixtures" / "scene-capture.json"
+FIXTURE = Path(__file__).parent / "fixtures" / "app-writes.json"
 
 
 @pytest.fixture(scope="session")
-def capture():
+def app_writes():
     return json.loads(FIXTURE.read_text())
-
-
-ORDERED = Path(__file__).parent / "fixtures" / "ordered-presets-capture.json"
-
-
-@pytest.fixture(scope="session")
-def ordered():
-    return json.loads(ORDERED.read_text())

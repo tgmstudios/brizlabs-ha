@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+import voluptuous as vol
 
 import custom_components.brizlabs as integ
 from custom_components.brizlabs import scenes as S
@@ -51,20 +52,39 @@ def test_select_platform_registered():
 async def test_services_registered_and_set_scene_sends_payload():
     hass = make_hass()
     await integ.async_setup(hass, {})
-    for name in ("set_properties", "paint_segments", "set_scene"):
+    for name in ("set_properties", "set_scene"):
         assert ("brizlabs", name) in hass.services.reg
+    assert ("brizlabs", "paint_segments") not in hass.services.reg
     fn, schema = hass.services.reg[("brizlabs", "set_scene")]
     a, b = FakeDevice("00:11:22:33:44:55"), FakeDevice("00:11:22:33:44:66")
     hass.data["brizlabs"] = {"1": a, "2": b}
-    data = schema({"address": "00:11:22:33:44:55", "effect": "Chase", "speed": 80, "brightness": 55,
-                   "colors": [{"hue": 0, "saturation": 100}, {"hue": 240, "saturation": 100, "value": 50}]})
+    data = schema({"address": "00:11:22:33:44:55", "effect": "Color Mixture",
+                   "brightness": 500, "mix": 100, "speed": 3})
     await fn(SimpleNamespace(data=data))
     assert b.sent == []
     props = a.sent[0]
-    assert props["bright_value"] == 55 and props["work_mode"] == "scene"
-    sc = S.decode_scene(props["dreamlight_scene_mode"])
-    assert (sc.scene_id, sc.speed) == (3, 80)
-    assert [(c.hue, c.saturation, c.value) for c in sc.colors] == [(0, 1000, 1000), (240, 1000, 500)]
+    assert S.decode(props["scene_select"]) == S.Scene(0x22, 500, 100, 3)
+
+
+async def test_set_scene_combine_override():
+    hass = make_hass()
+    await integ.async_setup(hass, {})
+    fn, schema = hass.services.reg[("brizlabs", "set_scene")]
+    a = FakeDevice("00:11:22:33:44:55")
+    hass.data["brizlabs"] = {"1": a}
+    await fn(SimpleNamespace(data=schema({"address": "00:11:22:33:44:55", "effect": "Loop",
+                                          "combine": "2021"})))
+    assert a.sent[0]["scene_combine"] == "2021"
+
+
+async def test_set_scene_rejects_out_of_range():
+    hass = make_hass()
+    await integ.async_setup(hass, {})
+    _, schema = hass.services.reg[("brizlabs", "set_scene")]
+    with pytest.raises(vol.Invalid):
+        schema({"address": "00:11:22:33:44:55", "effect": "Fade", "brightness": 1001})
+    with pytest.raises(vol.Invalid):
+        schema({"address": "00:11:22:33:44:55", "effect": "Fade", "speed": 5})
 
 
 async def test_set_scene_unknown_address():
@@ -73,7 +93,7 @@ async def test_set_scene_unknown_address():
     fn, schema = hass.services.reg[("brizlabs", "set_scene")]
     hass.data["brizlabs"] = {}
     with pytest.raises(ValueError):
-        await fn(SimpleNamespace(data=schema({"address": "x", "effect": "Fall", "colors": [{"hue": 1, "saturation": 1}]})))
+        await fn(SimpleNamespace(data=schema({"address": "x", "effect": "Fade"})))
 
 
 async def test_unload_reload_cycle(monkeypatch):

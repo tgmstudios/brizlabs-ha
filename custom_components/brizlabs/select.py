@@ -1,4 +1,4 @@
-"""Scene palette and music mode selectors."""
+"""Music style selector; written as a bare ``device_music`` set like the app does."""
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.core import callback
@@ -8,20 +8,22 @@ from homeassistant.helpers.entity import DeviceInfo
 from . import scenes
 from .const import DOMAIN
 
+MUSIC_OPTIONS = ["Rock & Roll", "Jazz", "Classical", "Energy", "Roll", "Pop", "Rock", "Kpop"]
+_NAME_TO_MUSIC = {name: i for i, name in enumerate(MUSIC_OPTIONS)}
+
 
 async def async_setup_entry(hass, entry, async_add_entities):
-    device = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([BrizlabsScenePaletteSelect(device, entry), BrizlabsMusicSelect(device, entry),
-                        BrizlabsSceneDirectionSelect(device, entry)])
+    async_add_entities([BrizlabsMusicSelect(hass.data[DOMAIN][entry.entry_id], entry)])
 
 
-class _BrizlabsSelect(SelectEntity):
+class BrizlabsMusicSelect(SelectEntity):
     _attr_has_entity_name = True
+    _attr_name = "Music mode"
+    _attr_options = MUSIC_OPTIONS
 
-    def __init__(self, device, entry, key, name):
+    def __init__(self, device, entry):
         self.device = device
-        self._attr_name = name
-        self._attr_unique_id = f"{device.address}_{key}"
+        self._attr_unique_id = f"{device.address}_music_mode"
         self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, device.address)})
 
     async def async_added_to_hass(self):
@@ -31,104 +33,20 @@ class _BrizlabsSelect(SelectEntity):
     def _changed(self):
         self.async_write_ha_state()
 
-
-class BrizlabsScenePaletteSelect(_BrizlabsSelect):
-    """Colour palette of the active scene (captured app palettes + Custom)."""
-
-    def __init__(self, device, entry):
-        super().__init__(device, entry, "scene_palette", "Scene palette")
-
-    def _payload(self):
-        values = self.device.values
-        if values.get("work_mode") != "scene":
-            return None
-        payload = values.get("dreamlight_scene_mode")
-        try:
-            scenes.decode_scene(payload)
-        except (ValueError, TypeError):
-            return None
-        return payload
-
     @property
     def available(self):
-        return self.device.available and self._payload() is not None
-
-    @property
-    def options(self):
-        payload = self._payload()
-        if payload is None:
-            return []
-        options = scenes.palette_options(scenes.decode_scene(payload).scene_id)
-        current = scenes.palette_label(payload)
-        return options + [current] if current not in options else options
-
-    @property
-    def current_option(self):
-        payload = self._payload()
-        return None if payload is None else scenes.palette_label(payload)
-
-    async def async_select_option(self, option):
-        payload = self._payload()
-        if payload is None:
-            raise HomeAssistantError("Palette can only be changed while a scene is active")
-        if option == scenes.palette_label(payload):
-            return  # already active (includes the read-only "Custom: ..." entry)
-        try:
-            new = scenes.apply_palette(payload, option)
-        except ValueError as exc:
-            raise HomeAssistantError(str(exc)) from exc
-        await self.device.send({"switch_led": True, "work_mode": "scene", "dreamlight_scene_mode": new})
-
-
-class BrizlabsSceneDirectionSelect(_BrizlabsSelect):
-    """Direction (header byte 0: Left=1, Right=0) of the active scene."""
-
-    _attr_options = scenes.DIRECTION_OPTIONS
-
-    def __init__(self, device, entry):
-        super().__init__(device, entry, "scene_direction", "Scene direction")
-
-    _payload = BrizlabsScenePaletteSelect._payload
-
-    @property
-    def available(self):
-        return self.device.available and self._payload() is not None
-
-    @property
-    def current_option(self):
-        payload = self._payload()
-        return None if payload is None else scenes.direction_label(payload)
-
-    async def async_select_option(self, option):
-        payload = self._payload()
-        if payload is None:
-            raise HomeAssistantError("Direction can only be changed while a scene is active")
-        try:
-            new = scenes.with_direction(payload, option)
-        except ValueError as exc:
-            raise HomeAssistantError(str(exc)) from exc
-        await self.device.send({"switch_led": True, "work_mode": "scene", "dreamlight_scene_mode": new})
-
-
-class BrizlabsMusicSelect(_BrizlabsSelect):
-    _attr_options = scenes.MUSIC_OPTIONS
-
-    def __init__(self, device, entry):
-        super().__init__(device, entry, "music_mode", "Music mode")
-
-    @property
-    def available(self):
+        # device_music never appears in the device's GET response; the control
+        # is usable while connected and tracks the style once one is set.
         return self.device.available
 
     @property
     def current_option(self):
-        if self.device.values.get("work_mode") != "music":
-            return None
-        return scenes.effect_for_values(self.device.values)
+        music = self.device.values.get("device_music")
+        return MUSIC_OPTIONS[music] if isinstance(music, int) and 0 <= music < len(MUSIC_OPTIONS) else None
 
     async def async_select_option(self, option):
         try:
-            music = scenes.music_id_for_name(option)
-        except ValueError as exc:
-            raise HomeAssistantError(str(exc)) from exc
-        await self.device.send({"switch_led": True, "work_mode": "music", "device_music": music})
+            music = _NAME_TO_MUSIC[option]
+        except KeyError as exc:
+            raise HomeAssistantError(f"Unknown music mode: {option}") from exc
+        await self.device.send({"device_music": music})

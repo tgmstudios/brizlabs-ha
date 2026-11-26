@@ -10,43 +10,9 @@ set_properties:
       required: true
       selector:
         object:
-paint_segments:
-  name: Paint segments
-  description: Set a color on selected zero-based segments of a micro string light.
-  fields:
-    address:
-      required: true
-      selector:
-        text:
-    segments:
-      required: true
-      selector:
-        object:
-    hue:
-      required: true
-      selector:
-        number:
-          min: 0
-          max: 360
-    saturation:
-      required: true
-      selector:
-        number:
-          min: 0
-          max: 100
-    value:
-      selector:
-        number:
-          min: 0
-          max: 100
-    segment_count:
-      selector:
-        number:
-          min: 1
-          max: 127
 set_scene:
   name: Set scene
-  description: Start a scene effect with an ordered list of colors (captured payload format; 1-7 colors).
+  description: Start a scene effect (scene_select protocol captured from the BrizLabs app).
   fields:
     address:
       required: true
@@ -54,28 +20,28 @@ set_scene:
         text:
     effect:
       required: true
-      description: Scene effect name (e.g. Rainbow, Flow, Fall).
+      description: Scene name, e.g. "Color Mixture", "C2 Steady On", "Loop", "Music".
       selector:
         text:
-    colors:
-      required: true
-      description: "Ordered list of {hue: 0-360, saturation: 0-100, value: 0-100}."
-      selector:
-        object:
-    speed:
+    brightness:
+      description: Scene brightness 0-1000 (default 1000).
       selector:
         number:
           min: 0
-          max: 100
-    brightness:
+          max: 1000
+    mix:
+      description: Colour-to-white balance 0-1000 (0 = full colour, 1000 = full white).
       selector:
         number:
-          min: 1
-          max: 100
-    direction:
-      description: Scene direction. Omit for Right (the default header).
+          min: 0
+          max: 1000
+    speed:
+      description: Animation speed 1-4 (0 for the steady scenes).
       selector:
-        select:
-          options:
-            - Left
-            - Right
+        number:
+          min: 0
+          max: 4
+    combine:
+      description: Loop sequence as concatenated scene hex ids (e.g. "2021"); defaults to all scenes.
+      selector:
+        text:

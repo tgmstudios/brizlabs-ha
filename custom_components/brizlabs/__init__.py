@@ -1,4 +1,4 @@
-"""Local Bluetooth control for BrizLabs RY micro string lights."""
+"""Service registration and the persistent BLE connection."""
 
 import asyncio
 import logging
@@ -19,61 +19,38 @@ from .protocol import Decoder, encode
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = ["light", "number", "select"]
 
-_COLOUR_SCHEMA = vol.Schema({
-    vol.Required("hue"): vol.All(vol.Coerce(float), vol.Range(min=0, max=360)),
-    vol.Required("saturation"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
-    vol.Optional("value", default=100): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
-})
 SET_SCENE_SCHEMA = vol.Schema({
     vol.Required("address"): str,
-    vol.Required("effect"): vol.In(sorted(scenes.SCENE_NAMES.values())),
-    vol.Required("colors"): vol.All([_COLOUR_SCHEMA], vol.Length(min=1, max=scenes.MAX_COLOURS)),
-    vol.Optional("speed", default=50): vol.All(vol.Coerce(int), vol.Range(min=0, max=scenes.MAX_SPEED)),
-    vol.Optional("brightness"): vol.All(vol.Coerce(int), vol.Range(min=1, max=100)),
-    vol.Optional("direction"): vol.In(scenes.DIRECTION_OPTIONS),
+    vol.Required("effect"): vol.In(scenes.EFFECT_LIST),
+    vol.Optional("brightness"): vol.All(vol.Coerce(int), vol.Range(min=0, max=scenes.MAX_LEVEL)),
+    vol.Optional("mix"): vol.All(vol.Coerce(int), vol.Range(min=0, max=scenes.MAX_LEVEL)),
+    vol.Optional("speed"): vol.All(vol.Coerce(int), vol.Range(min=0, max=scenes.MAX_SPEED)),
+    vol.Optional("combine"): vol.All(str, vol.Length(min=2, max=28)),
 })
 SCAN_LOCK = asyncio.Lock()
 
 
 async def async_setup(hass, config):
+    def _device(call):
+        address = call.data["address"].upper()
+        device = next((d for d in hass.data.get(DOMAIN, {}).values() if d.address == address), None)
+        if device is None:
+            raise ValueError(f"No BrizLabs device configured at {address}")
+        return device
+
     async def set_properties(call):
-        address = call.data["address"].upper()
-        device = next((d for d in hass.data.get(DOMAIN, {}).values() if d.address == address), None)
-        if device is None:
-            raise ValueError(f"No BrizLabs device configured at {address}")
-        await device.send(call.data["properties"])
-
-    async def paint_segments(call):
-        from .light import paint_colour
-
-        address = call.data["address"].upper()
-        device = next((d for d in hass.data.get(DOMAIN, {}).values() if d.address == address), None)
-        if device is None:
-            raise ValueError(f"No BrizLabs device configured at {address}")
-        paint = paint_colour(call.data["hue"], call.data["saturation"],
-                             call.data.get("value", 100), call.data["segments"],
-                             call.data.get("segment_count", 20))
-        await device.send({"switch_led": True, "work_mode": "colour", "paint_colour_data": paint})
+        await _device(call).send(call.data["properties"])
 
     async def set_scene(call):
-        address = call.data["address"].upper()
-        device = next((d for d in hass.data.get(DOMAIN, {}).values() if d.address == address), None)
-        if device is None:
-            raise ValueError(f"No BrizLabs device configured at {address}")
-        colors = [(c["hue"], c["saturation"], c["value"]) for c in call.data["colors"]]
-        await device.send(scenes.set_scene_properties(
-            call.data["effect"], colors, call.data["speed"], call.data.get("brightness"),
-            call.data.get("direction")))
+        props = scenes.scene_properties(call.data["effect"], call.data.get("brightness"),
+                                        call.data.get("mix"), call.data.get("speed"))
+        if "combine" in call.data:
+            props["scene_combine"] = call.data["combine"]
+        await _device(call).send(props)
 
     hass.services.async_register(DOMAIN, "set_scene", set_scene, schema=SET_SCENE_SCHEMA)
     hass.services.async_register(DOMAIN, "set_properties", set_properties,
         schema=vol.Schema({vol.Required("address"): str, vol.Required("properties"): dict}))
-    hass.services.async_register(DOMAIN, "paint_segments", paint_segments,
-        schema=vol.Schema({vol.Required("address"): str, vol.Required("segments"): [vol.Coerce(int)],
-                           vol.Required("hue"): vol.Coerce(float),
-                           vol.Required("saturation"): vol.Coerce(float),
-                           vol.Optional("value", default=100): vol.Coerce(float),
-                           vol.Optional("segment_count", default=20): vol.Coerce(int)}))
     return True
 
 
@@ -107,7 +84,9 @@ class BrizlabsDevice:
             return
         changed = False
         for key, value in message.get("data", {}).items():
-            if isinstance(value, dict) and "value" in value:
+            if isinstance(value, dict):
+                if "value" not in value:
+                    continue  # valueless set-ack; keep last known value
                 value = value["value"]
             if self.values.get(key) != value:
                 self.values[key] = value
@@ -189,15 +168,26 @@ class BrizlabsDevice:
         if not self.client or not self.client.is_connected:
             raise ConnectionError(f"BrizLabs {self.address} is disconnected")
         message = {
-            "msgId": uuid.uuid4().hex[:16],
             "ts": int(time.time()),
             "data": properties if properties is not None else [],
             "type": "thing.property.set" if properties is not None else "thing.property.get",
         }
+        if properties is not None:
+            message["msgId"] = uuid.uuid4().hex[:16]
         async with self.lock:
             for packet in encode(message):
                 await self.client.write_gatt_char(self.write_char, packet, response=True)
                 await asyncio.sleep(0.03)
+            if properties is not None:
+                # The device echoes some sets without a value and never reports
+                # its true render state, so track what we set ourselves.
+                changed = False
+                for key, value in properties.items():
+                    if self.values.get(key) != value:
+                        self.values[key] = value
+                        changed = True
+                if changed:
+                    self.update()
 
     async def get(self):
         await self.send()

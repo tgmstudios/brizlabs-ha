@@ -1,26 +1,11 @@
-"""Light entity with RGB, brightness, Flow scene, and segmented painting."""
+"""Light entity: switch, brightness, and scene effects over ``scene_select``."""
 
-from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_EFFECT, ATTR_HS_COLOR, ColorMode, LightEntity, LightEntityFeature
+from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_EFFECT, ColorMode, LightEntity, LightEntityFeature
 from homeassistant.core import callback
 from homeassistant.helpers.entity import DeviceInfo
 
 from . import scenes
-from .const import DOMAIN, FLOW_SCENE
-
-
-def paint_colour(hue, saturation, value, segments=(), count=0):
-    """Tuya strip smear data: version/mode/effect/count/action/HSV/selection."""
-    hue = round(hue) % 360
-    sat = max(0, min(1000, round(saturation * 10)))
-    val = max(0, min(1000, round(value * 10)))
-    action = 1 if segments else 0
-    result = f"000100{count:02x}{action:02x}{hue:04x}{sat:04x}{val:04x}"
-    if segments:
-        chosen = sorted(set(int(x) for x in segments))
-        if not chosen or any(x < 0 or x >= count for x in chosen) or len(chosen) > 127:
-            raise ValueError("Segments must be zero-based indices within the configured count")
-        result += f"{(128 + len(chosen)):02x}" + "".join(f"{x + 1:02x}" for x in chosen)
-    return result
+from .const import DOMAIN
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -30,8 +15,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
 class BrizlabsLight(LightEntity):
     _attr_has_entity_name = True
     _attr_name = None
-    _attr_supported_color_modes = {ColorMode.HS}
-    _attr_color_mode = ColorMode.HS
+    _attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+    _attr_color_mode = ColorMode.BRIGHTNESS
     _attr_effect_list = scenes.EFFECT_LIST
     _attr_supported_features = LightEntityFeature.EFFECT
 
@@ -63,47 +48,42 @@ class BrizlabsLight(LightEntity):
 
     @property
     def brightness(self):
-        return round(int(self.device.values.get("bright_value", 100)) * 255 / 100)
+        scene = scenes.decode(self.device.values.get("scene_select"))
+        level = scene.brightness if scene else round(int(self.device.values.get("bright_value", 100)) * 10)
+        return max(1, min(255, round(level * 255 / scenes.MAX_LEVEL)))
 
     @property
     def effect(self):
         return scenes.effect_for_values(self.device.values)
 
     @property
-    def hs_color(self):
-        value = self.device.values.get("paint_colour_data", "")
-        if len(value) >= 22 and value[:4] == "0001":
-            try:
-                return (int(value[10:14], 16), int(value[14:18], 16) / 10)
-            except ValueError:
-                pass
-        return (0, 100)
-
-    @property
     def extra_state_attributes(self):
-        return {"light_pixel": self.device.values.get("light_pixel"),
-                "work_mode": self.device.values.get("work_mode"),
-                "device_music": self.device.values.get("device_music"),
-                "scene_data": self.device.values.get("dreamlight_scene_mode"),
-                "scene_palette": scenes.palette_label(self.device.values.get("dreamlight_scene_mode") or "")
-                if self.device.values.get("work_mode") == "scene" else None}
+        scene = scenes.decode(self.device.values.get("scene_select"))
+        return {"scene_select": self.device.values.get("scene_select"),
+                "scene_combine": self.device.values.get("scene_combine"),
+                "white_mix": None if scene is None else round(scene.mix / 10),
+                "scene_speed": None if scene is None else scene.speed}
 
     async def async_turn_on(self, **kwargs):
         data = {"switch_led": True}
-        if ATTR_BRIGHTNESS in kwargs:
-            data["bright_value"] = max(1, min(100, round(kwargs[ATTR_BRIGHTNESS] * 100 / 255)))
-        if ATTR_HS_COLOR in kwargs:
-            hue, saturation = kwargs[ATTR_HS_COLOR]
-            data["work_mode"] = "colour"
-            data["paint_colour_data"] = paint_colour(hue, saturation, 100)
-        elif ATTR_EFFECT in kwargs:
+        current = self.device.values.get("scene_select")
+        scene = scenes.decode(current)
+        if ATTR_EFFECT in kwargs:
             effect = kwargs[ATTR_EFFECT]
-            if effect in scenes.SCENE_NAMES.values():
-                data["work_mode"] = "scene"
-                data["dreamlight_scene_mode"] = scenes.default_scene_payload(scenes.scene_id_for_name(effect))
+            if effect == scenes.MUSIC_NAME:
+                data["device_music"] = 0
             else:
-                data["work_mode"] = "music"
-                data["device_music"] = scenes.music_id_for_name(effect)
+                props = scenes.scene_properties(effect)
+                if ATTR_BRIGHTNESS in kwargs:
+                    level = round(kwargs[ATTR_BRIGHTNESS] * scenes.MAX_LEVEL / 255)
+                    props["scene_select"] = scenes.with_brightness(props["scene_select"], level)
+                data.update(props)
+        elif ATTR_BRIGHTNESS in kwargs:
+            level = round(kwargs[ATTR_BRIGHTNESS] * scenes.MAX_LEVEL / 255)
+            if scene is not None:
+                data["scene_select"] = scenes.with_brightness(current, level)
+            else:
+                data["bright_value"] = max(1, min(100, round(kwargs[ATTR_BRIGHTNESS] * 100 / 255)))
         await self.device.send(data)
 
     async def async_turn_off(self, **kwargs):

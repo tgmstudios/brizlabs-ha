@@ -1,11 +1,11 @@
 import pytest
-import voluptuous as vol
+from homeassistant.components.light import ColorMode
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.brizlabs import scenes as S
 from custom_components.brizlabs.light import BrizlabsLight
-from custom_components.brizlabs.number import BrizlabsNumber, BrizlabsSceneSpeed
-from custom_components.brizlabs.select import BrizlabsMusicSelect, BrizlabsScenePaletteSelect
+from custom_components.brizlabs.number import BrizlabsNumber, BrizlabsSceneField
+from custom_components.brizlabs.select import BrizlabsMusicSelect
 from tests.fakes import FakeDevice, entry, scene_values
 
 
@@ -20,247 +20,196 @@ def wire(ent):
 
 
 # ---- light -------------------------------------------------------------
-def test_light_reports_effect_from_state_not_constant():
-    dev = FakeDevice(values=scene_values(8))
+def test_light_reports_effect_from_scene_select():
+    dev = FakeDevice(values=scene_values("In Waves"))
     light = BrizlabsLight(dev, entry())
-    assert light.effect == "Fall"
-    dev.values = scene_values(0)
-    assert light.effect == "Rainbow"
-    dev.values = {"work_mode": "music", "device_music": 4}
-    assert light.effect == "Roll"
-    dev.values = {"work_mode": "colour"}
+    assert light.effect == "In Waves"
+    dev.values = scene_values("C2 Steady On")
+    assert light.effect == "C2 Steady On"
+    dev.values = {"device_music": 4}
+    assert light.effect == "Music"
+    dev.values = {"switch_led": True}
     assert light.effect is None
 
 
-def test_light_effect_list_has_all_scenes_and_music():
+def test_light_effect_list_is_scene_grid():
     light = BrizlabsLight(FakeDevice(), entry())
-    for n in ("Rainbow", "Flow", "Fall", "Fade", "Flutter", "Scene 16", "Rock & Roll", "Kpop", "Music 0", "Music 7"):
-        assert n in light.effect_list
-    assert len([e for e in light.effect_list if e.startswith("Music ")]) == 8
-    assert len(light.effect_list) == len(set(light.effect_list))
+    assert light.effect_list == S.EFFECT_LIST
+    assert "Color Mixture" in light.effect_list and "Loop" in light.effect_list
 
 
 def test_light_unique_id_unchanged():
     assert BrizlabsLight(FakeDevice("00:11:22:33:44:55"), entry()).unique_id == "001122334455"
 
 
+def test_light_is_brightness_only():
+    light = BrizlabsLight(FakeDevice(), entry())
+    assert light.supported_color_modes == {ColorMode.BRIGHTNESS}
+
+
 @pytest.mark.asyncio
-async def test_light_turn_on_scene_effect_sends_captured_default():
+async def test_turn_on_plain_sends_only_switch():
     dev = FakeDevice()
-    await BrizlabsLight(dev, entry()).async_turn_on(effect="Fade")
-    assert dev.sent == [{"switch_led": True, "work_mode": "scene",
-                         "dreamlight_scene_mode": S.CAPTURED_PALETTES[7][0]}]
+    await BrizlabsLight(dev, entry()).async_turn_on()
+    assert dev.sent == [{"switch_led": True}]
 
 
 @pytest.mark.asyncio
-async def test_light_turn_on_flow_unchanged_payload():
-    from custom_components.brizlabs.const import FLOW_SCENE  # legacy constant kept
+async def test_turn_on_scene_effect_sends_app_default():
     dev = FakeDevice()
-    await BrizlabsLight(dev, entry()).async_turn_on(effect="Flow")
-    assert dev.sent[0]["work_mode"] == "scene"
-    assert S.decode_scene(dev.sent[0]["dreamlight_scene_mode"]).scene_id == 1
-    assert S.decode_scene(FLOW_SCENE).scene_id == 1
+    await BrizlabsLight(dev, entry()).async_turn_on(effect="Color Mixture")
+    assert dev.sent == [{"switch_led": True, "scene_select": "2203e801f40100000"}]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("effect,music", [("Music 3", 3), ("Music", 7)])
-async def test_light_turn_on_music(effect, music):
+async def test_turn_on_loop_includes_combine():
     dev = FakeDevice()
-    await BrizlabsLight(dev, entry()).async_turn_on(effect=effect)
-    assert dev.sent == [{"switch_led": True, "work_mode": "music", "device_music": music}]
+    await BrizlabsLight(dev, entry()).async_turn_on(effect="Loop")
+    assert dev.sent[0]["scene_select"] == "1e03e800000100000"
+    assert dev.sent[0]["scene_combine"] == S.ALL_COMBINE
 
 
 @pytest.mark.asyncio
-async def test_light_unknown_effect_rejected():
+async def test_turn_on_music_effect_sends_device_music():
     dev = FakeDevice()
-    with pytest.raises(ValueError):
-        await BrizlabsLight(dev, entry()).async_turn_on(effect="Nope")
-    assert dev.sent == []
+    await BrizlabsLight(dev, entry()).async_turn_on(effect="Music")
+    assert dev.sent == [{"switch_led": True, "device_music": 0}]
 
 
 @pytest.mark.asyncio
-async def test_light_no_optimistic_state():
-    dev = FakeDevice(values={"work_mode": "colour"})
-    light = BrizlabsLight(dev, entry())
-    await light.async_turn_on(effect="Fall")
-    assert light.effect is None  # only hardware report changes it
+async def test_turn_on_brightness_merges_into_active_scene():
+    dev = FakeDevice(values=scene_values("C2 Breath"))
+    await BrizlabsLight(dev, entry()).async_turn_on(brightness=126)  # ~49%
+    payload = dev.sent[0]["scene_select"]
+    assert S.decode(payload).brightness == round(126 * 1000 / 255)
+    assert S.decode(payload).scene_id == 0x25
 
 
-def test_light_keeps_segment_painting_helper():
-    from custom_components.brizlabs.light import paint_colour
-    assert paint_colour(120, 100, 100, [0, 2], 20).startswith("00010014" + "01")
+@pytest.mark.asyncio
+async def test_turn_on_brightness_without_scene_falls_back_to_bright_value():
+    dev = FakeDevice()
+    await BrizlabsLight(dev, entry()).async_turn_on(brightness=128)
+    assert dev.sent == [{"switch_led": True, "bright_value": 50}]
 
 
-# ---- palette select ----------------------------------------------------
-def test_palette_select_options_follow_current_scene():
-    dev = FakeDevice(values=scene_values(2))
-    sel = BrizlabsScenePaletteSelect(dev, entry())
-    assert sel.options == S.palette_options(2)
-    assert sel.current_option == "White, Green"  # legacy extra, not one of the 15 presets
-    assert sel.current_option in sel.options
-    dev.values = scene_values(1, 1)
-    assert sel.options == S.palette_options(1)
-    assert sel.current_option == "Rainbow 3"
+@pytest.mark.asyncio
+async def test_turn_on_effect_with_brightness():
+    dev = FakeDevice()
+    await BrizlabsLight(dev, entry()).async_turn_on(effect="Fade", brightness=51)
+    assert S.decode(dev.sent[0]["scene_select"]).brightness == 200
 
 
-def test_palette_select_unavailable_or_empty_outside_scene():
-    dev = FakeDevice(values={"work_mode": "music", "device_music": 1})
-    sel = BrizlabsScenePaletteSelect(dev, entry())
+@pytest.mark.asyncio
+async def test_turn_off():
+    dev = FakeDevice()
+    await BrizlabsLight(dev, entry()).async_turn_off()
+    assert dev.sent == [{"switch_led": False}]
+
+
+def test_light_brightness_tracks_scene_select():
+    dev = FakeDevice(values={"scene_select": "2501ec00000100000"})  # 492/1000
+    assert BrizlabsLight(dev, entry()).brightness == round(492 * 255 / 1000)
+
+
+def test_light_extra_attributes_expose_scene():
+    dev = FakeDevice(values=scene_values("Slow-Glow"))
+    attrs = BrizlabsLight(dev, entry()).extra_state_attributes
+    assert attrs["white_mix"] == 50
+    assert attrs["scene_speed"] == 1
+    assert attrs["scene_select"] == "2c03e801f40100000"
+
+
+# ---- numbers -----------------------------------------------------------
+def test_mic_sensitivity_number():
+    dev = FakeDevice(values={"sensitivity": 73})
+    num = wire(BrizlabsNumber(dev, "sensitivity", 0, 100, "Mic sensitivity"))
+    assert num.available and num.native_value == 73
+
+
+@pytest.mark.asyncio
+async def test_mic_sensitivity_set():
+    dev = FakeDevice(values={"sensitivity": 0})
+    num = BrizlabsNumber(dev, "sensitivity", 0, 100, "Mic sensitivity")
+    await num.async_set_native_value(73)
+    assert dev.sent == [{"sensitivity": 73}]
+
+
+def test_white_mix_reads_percent():
+    dev = FakeDevice(values=scene_values("Color Mixture"))
+    num = wire(BrizlabsSceneField(dev, "mix", "White mix", 10))
+    assert num.available and num.native_value == 50
+
+
+@pytest.mark.asyncio
+async def test_white_mix_set_writes_scaled():
+    dev = FakeDevice(values=scene_values("Color Mixture"))
+    num = BrizlabsSceneField(dev, "mix", "White mix", 10)
+    await num.async_set_native_value(14)
+    assert dev.sent == [{"scene_select": "2203e8008c0100000"}]
+
+
+def test_scene_speed_reads():
+    dev = FakeDevice(values=scene_values("C2 Breath"))
+    num = wire(BrizlabsSceneField(dev, "speed", "Scene speed", 1))
+    assert num.available and num.native_value == 1
+
+
+@pytest.mark.asyncio
+async def test_scene_speed_set():
+    dev = FakeDevice(values=scene_values("C2 Breath"))
+    num = BrizlabsSceneField(dev, "speed", "Scene speed", 1)
+    await num.async_set_native_value(3)
+    assert dev.sent == [{"scene_select": "2503e800000300000"}]
+
+
+@pytest.mark.asyncio
+async def test_scene_field_without_scene_errors():
+    dev = FakeDevice()
+    num = BrizlabsSceneField(dev, "mix", "White mix", 10)
+    with pytest.raises(HomeAssistantError):
+        await num.async_set_native_value(50)
+
+
+def test_scene_field_unavailable_without_scene():
+    num = wire(BrizlabsSceneField(FakeDevice(), "speed", "Scene speed", 1))
+    assert not num.available
+
+
+# ---- music select --------------------------------------------------------
+def test_music_select_available_while_connected():
+    sel = wire(BrizlabsMusicSelect(FakeDevice(), entry()))
+    assert sel.available  # device_music is never reported; control stays usable
     assert sel.current_option is None
-    assert sel.available is False
 
 
-def test_palette_select_shows_custom_palette_as_current():
-    custom = S.encode_scene(S.build_scene(1, [(10, 100, 100), (20, 100, 100)]))
-    dev = FakeDevice(values={"work_mode": "scene", "dreamlight_scene_mode": custom})
-    sel = BrizlabsScenePaletteSelect(dev, entry())
-    assert sel.current_option == "Custom: Hue 10, Hue 20"
-    assert sel.current_option in sel.options
+def test_music_select_tracks_state():
+    dev = FakeDevice(values={"device_music": 2})
+    sel = wire(BrizlabsMusicSelect(dev, entry()))
+    assert sel.current_option == "Classical"
 
 
 @pytest.mark.asyncio
-async def test_palette_select_preserves_speed_scene_and_brightness():
-    base = S.decode_scene(S.CAPTURED_PALETTES[1][0])
-    cur = S.encode_scene(S.Scene(0, 1, 2, 33, base.colors))
-    dev = FakeDevice(values={"work_mode": "scene", "bright_value": 40, "dreamlight_scene_mode": cur})
-    sel = wire(BrizlabsScenePaletteSelect(dev, entry()))
-    target = "Rainbow 1"
-    await sel.async_select_option(target)
-    assert len(dev.sent) == 1 and set(dev.sent[0]) == {"switch_led", "work_mode", "dreamlight_scene_mode"}
-    assert dev.sent[0]["work_mode"] == "scene"
-    new = S.decode_scene(dev.sent[0]["dreamlight_scene_mode"])
-    assert (new.scene_id, new.speed) == (1, 33)
-    assert S.palette_label(dev.sent[0]["dreamlight_scene_mode"]) == target
-    assert "bright_value" not in dev.sent[0]
-    # not optimistic: selection unchanged until hardware reports
-    assert sel.current_option == "Rainbow 2"
-    dev.report(dreamlight_scene_mode=dev.sent[0]["dreamlight_scene_mode"])
-    assert sel.current_option == target
-
-
-@pytest.mark.asyncio
-async def test_palette_select_follows_app_update():
-    dev = FakeDevice(values=scene_values(3))
-    sel = wire(BrizlabsScenePaletteSelect(dev, entry()))
-    await sel.async_added_to_hass()
-    dev.report(**scene_values(3, 1))
-    assert sel.written == 1 and sel.current_option == "Purple, Green"
-
-
-@pytest.mark.asyncio
-async def test_palette_select_rejects_invalid_and_not_in_scene():
-    dev = FakeDevice(values=scene_values(2))
-    sel = BrizlabsScenePaletteSelect(dev, entry())
-    with pytest.raises(HomeAssistantError):
-        await sel.async_select_option("Bogus")
-    dev2 = FakeDevice(values={"work_mode": "music", "device_music": 0})
-    with pytest.raises(HomeAssistantError):
-        await BrizlabsScenePaletteSelect(dev2, entry()).async_select_option("White, Green")
-    assert dev.sent == [] and dev2.sent == []
-
-
-# ---- music select ------------------------------------------------------
-def test_music_select():
-    dev = FakeDevice(values={"work_mode": "music", "device_music": 5})
-    sel = BrizlabsMusicSelect(dev, entry())
-    assert sel.options == S.MUSIC_OPTIONS and sel.current_option == "Pop"
-    dev.values = scene_values(1)
-    assert sel.current_option is None
-
-
-@pytest.mark.asyncio
-async def test_music_select_sends_and_validates():
+async def test_music_select_sends_bare_device_music():
     dev = FakeDevice()
     sel = BrizlabsMusicSelect(dev, entry())
-    await sel.async_select_option("Music 2")
-    assert dev.sent == [{"switch_led": True, "work_mode": "music", "device_music": 2}]
-    with pytest.raises(HomeAssistantError):
-        await sel.async_select_option("Music 9")
-
-
-def test_select_unique_ids_distinct_and_stable():
-    d = FakeDevice("AA:BB:CC:DD:EE:FF")
-    a, b = BrizlabsScenePaletteSelect(d, entry()), BrizlabsMusicSelect(d, entry())
-    assert a.unique_id == "AA:BB:CC:DD:EE:FF_scene_palette"
-    assert b.unique_id == "AA:BB:CC:DD:EE:FF_music_mode"
-
-
-# ---- speed number ------------------------------------------------------
-def test_existing_number_ids_unchanged():
-    d = FakeDevice()
-    assert BrizlabsNumber(d, entry(), "sensitivity", 0, 100).unique_id == f"{d.address}_sensitivity"
-    assert BrizlabsNumber(d, entry(), "lightpixel_number_set", 1, 200).unique_id == f"{d.address}_lightpixel_number_set"
+    await sel.async_select_option("Energy")
+    assert dev.sent == [{"device_music": 3}]
 
 
 @pytest.mark.asyncio
-async def test_scene_speed_number():
-    dev = FakeDevice(values=scene_values(8))
-    n = BrizlabsSceneSpeed(dev, entry())
-    assert n.native_value == 50 and n.available
-    await n.async_set_native_value(77)
-    sent = dev.sent[0]
-    assert sent["work_mode"] == "scene"
-    new = S.decode_scene(sent["dreamlight_scene_mode"])
-    assert new.speed == 77 and new.colors == S.decode_scene(dev.values["dreamlight_scene_mode"]).colors
-    assert n.native_value == 50  # no optimism
-    dev.values = {"work_mode": "music", "device_music": 1}
-    assert not n.available and n.native_value is None
+async def test_music_select_rejects_unknown():
+    dev = FakeDevice()
+    sel = BrizlabsMusicSelect(dev, entry())
     with pytest.raises(HomeAssistantError):
-        await n.async_set_native_value(10)
+        await sel.async_select_option("Opera")
 
 
-# ---- per-device isolation ---------------------------------------------
+# ---- subscription --------------------------------------------------------
 @pytest.mark.asyncio
-async def test_devices_are_isolated():
-    a = FakeDevice("00:11:22:33:44:55", scene_values(8))
-    b = FakeDevice("00:11:22:33:44:66", {"work_mode": "music", "device_music": 2})
-    la, lb = BrizlabsLight(a, entry("Test Light")), BrizlabsLight(b, entry("Other"))
-    sa, sb = wire(BrizlabsScenePaletteSelect(a, entry())), wire(BrizlabsScenePaletteSelect(b, entry()))
-    await sa.async_added_to_hass(); await sb.async_added_to_hass()
-    a.report(**scene_values(4))
-    assert (sa.written, sb.written) == (1, 0)
-    assert (la.effect, lb.effect) == ("Shooting Star", "Classical")
-    await BrizlabsMusicSelect(b, entry()).async_select_option("Music 6")
-    assert a.sent == [] and b.sent[0]["device_music"] == 6
-
-
-# ---- set_scene properties + schema -------------------------------------
-def test_scene_properties_builder():
-    props = S.set_scene_properties("Fade", [(0, 100, 100), (240, 100, 100)], speed=20)
-    assert props["switch_led"] is True and props["work_mode"] == "scene"
-    sc = S.decode_scene(props["dreamlight_scene_mode"])
-    assert (sc.scene_id, sc.speed) == (7, 20) and len(sc.colors) == 2
-    assert "bright_value" not in props
-    assert S.set_scene_properties("Fade", [(0, 100, 100)], brightness=30)["bright_value"] == 30
-    with pytest.raises(ValueError):
-        S.set_scene_properties("Music 1", [(0, 100, 100)])
-    with pytest.raises(ValueError):
-        S.set_scene_properties("Fade", [(0, 100, 100)], brightness=0)
-
-
-def test_set_scene_schema():
-    from custom_components.brizlabs import SET_SCENE_SCHEMA
-    ok = SET_SCENE_SCHEMA({"address": "aa", "effect": "Fall",
-                           "colors": [{"hue": 10, "saturation": 100}, {"hue": 20, "saturation": 50, "value": 40}]})
-    assert ok["speed"] == 50 and ok["colors"][0]["value"] == 100
-    for bad in ({"address": "a", "effect": "Nope", "colors": [{"hue": 1, "saturation": 1}]},
-                {"address": "a", "effect": "Fall", "colors": []},
-                {"address": "a", "effect": "Fall", "colors": [{"hue": 400, "saturation": 1}]},
-                {"address": "a", "effect": "Fall", "colors": [{"hue": 1, "saturation": 1}] * 8},
-                {"address": "a", "effect": "Fall", "colors": [{"hue": 1, "saturation": 1}], "speed": 101},
-                {"address": "a", "effect": "Fall"}):
-        with pytest.raises(vol.Invalid):
-            SET_SCENE_SCHEMA(bad)
-
-
-@pytest.mark.asyncio
-async def test_palette_select_current_custom_option_is_noop():
-    custom = S.encode_scene(S.build_scene(1, [(10, 100, 100), (20, 100, 100)]))
-    dev = FakeDevice(values={"work_mode": "scene", "dreamlight_scene_mode": custom})
-    sel = wire(BrizlabsScenePaletteSelect(dev, entry()))
-    await sel.async_select_option(sel.current_option)  # must not raise
-    assert dev.sent == [] and dev.values["dreamlight_scene_mode"] == custom
-    # a stale Custom label that is no longer current is still rejected
-    with pytest.raises(HomeAssistantError):
-        await sel.async_select_option("Custom: Hue 99")
-    assert dev.sent == []
+async def test_entities_resubscribe_pattern():
+    dev = FakeDevice()
+    for ent in (BrizlabsLight(dev, entry()), BrizlabsMusicSelect(dev, entry())):
+        removers = []
+        ent.async_on_remove = removers.append
+        await ent.async_added_to_hass()
+    assert len(dev.listeners) == 2

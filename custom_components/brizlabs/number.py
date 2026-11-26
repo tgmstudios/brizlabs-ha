@@ -1,4 +1,4 @@
-"""BrizLabs sensitivity and pixel count controls."""
+"""White mix, scene speed, and microphone sensitivity controls."""
 
 from homeassistant.components.number import NumberEntity
 from homeassistant.core import callback
@@ -11,22 +11,22 @@ from .const import DOMAIN
 
 async def async_setup_entry(hass, entry, async_add_entities):
     device = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([BrizlabsNumber(device, entry, "sensitivity", 0, 100),
-                        BrizlabsNumber(device, entry, "lightpixel_number_set", 1, 200),
-                        BrizlabsSceneSpeed(device, entry)])
+    async_add_entities([BrizlabsNumber(device, "sensitivity", 0, 100, "Mic sensitivity"),
+                        BrizlabsSceneField(device, "mix", "White mix", 10),
+                        BrizlabsSceneField(device, "speed", "Scene speed", 1)])
 
 
 class BrizlabsNumber(NumberEntity):
     _attr_has_entity_name = True
     _attr_native_step = 1
 
-    def __init__(self, device, entry, key, minimum, maximum):
+    def __init__(self, device, key, minimum, maximum, name):
         self.device = device
         self.key = key
-        self._attr_name = "Music sensitivity" if key == "sensitivity" else "Pixel count"
-        self._attr_unique_id = f"{device.address}_{key}"
+        self._attr_name = name
         self._attr_native_min_value = minimum
         self._attr_native_max_value = maximum
+        self._attr_unique_id = f"{device.address}_{key}"
         self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, device.address)})
 
     async def async_added_to_hass(self):
@@ -48,18 +48,20 @@ class BrizlabsNumber(NumberEntity):
         await self.device.send({self.key: int(value)})
 
 
-class BrizlabsSceneSpeed(NumberEntity):
-    """Speed byte (header byte 3) of the active scene payload."""
+class BrizlabsSceneField(NumberEntity):
+    """Brightness-scaled field (white mix) or speed of the active scene."""
 
     _attr_has_entity_name = True
-    _attr_name = "Scene speed"
     _attr_native_step = 1
-    _attr_native_min_value = 0
-    _attr_native_max_value = scenes.MAX_SPEED
 
-    def __init__(self, device, entry):
+    def __init__(self, device, field, name, scale):
         self.device = device
-        self._attr_unique_id = f"{device.address}_scene_speed"
+        self.field = field  # scenes.Scene attribute written back into scene_select
+        self.scale = scale  # HA unit per payload unit (10 = percent, 1 = raw)
+        self._attr_name = name
+        self._attr_native_min_value = 0
+        self._attr_native_max_value = scenes.MAX_LEVEL // scale if scale > 1 else scenes.MAX_SPEED
+        self._attr_unique_id = f"{device.address}_scene_{field}"
         self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, device.address)})
 
     async def async_added_to_hass(self):
@@ -70,27 +72,27 @@ class BrizlabsSceneSpeed(NumberEntity):
         self.async_write_ha_state()
 
     def _payload(self):
-        if self.device.values.get("work_mode") != "scene":
-            return None
-        payload = self.device.values.get("dreamlight_scene_mode")
-        try:
-            scenes.decode_scene(payload)
-        except (ValueError, TypeError):
-            return None
-        return payload
+        return self.device.values.get("scene_select")
 
     @property
     def available(self):
-        return self.device.available and self._payload() is not None
+        return self.device.available and scenes.decode(self._payload()) is not None
 
     @property
     def native_value(self):
-        payload = self._payload()
-        return None if payload is None else scenes.decode_scene(payload).speed
+        scene = scenes.decode(self._payload())
+        if scene is None:
+            return None
+        value = getattr(scene, self.field)
+        return value // self.scale if self.scale > 1 else value
 
     async def async_set_native_value(self, value):
         payload = self._payload()
-        if payload is None:
-            raise HomeAssistantError("Speed can only be changed while a scene is active")
-        await self.device.send({"switch_led": True, "work_mode": "scene",
-                                "dreamlight_scene_mode": scenes.with_speed(payload, int(value))})
+        if scenes.decode(payload) is None:
+            raise HomeAssistantError("Select a scene effect first")
+        raw = int(value) * self.scale
+        try:
+            new = scenes.with_mix(payload, raw) if self.field == "mix" else scenes.with_speed(payload, int(value))
+        except ValueError as exc:
+            raise HomeAssistantError(str(exc)) from exc
+        await self.device.send({"scene_select": new})

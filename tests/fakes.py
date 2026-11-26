@@ -33,6 +33,6 @@ def entry(title="Test Light", entry_id="e1", address="00:11:22:33:44:55"):
     return SimpleNamespace(title=title, entry_id=entry_id, data={"address": address})
 
 
-def scene_values(scene_id, index=0, **extra):
-    return {"switch_led": True, "work_mode": "scene", "bright_value": 80,
-            "dreamlight_scene_mode": S.CAPTURED_PALETTES[scene_id][index], **extra}
+def scene_values(effect, **extra):
+    return {"switch_led": True,
+            "scene_select": S.encode(S.defaults(S.scene_id_for_name(effect))), **extra}
